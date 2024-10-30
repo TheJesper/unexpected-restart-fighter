@@ -1,80 +1,92 @@
-# Save as `unexpected-restart-fighter.ps1`
+# unexpected-restart-fighter.ps1
 
-# Spinner function to show progress
-function Show-Spinner {
+# Parameter block for verbose and help options
+param (
+    [switch]$Verbose,
+    [switch]$Help
+)
+
+# Define log file paths (relative to script folder)
+$scriptDir = Split-Path -Path $MyInvocation.MyCommand.Definition -Parent
+$logFile = Join-Path -Path $scriptDir -ChildPath "DetailedRestartLogs.txt"
+
+# Check for help flag
+if ($Help) {
+    Write-Output "Usage: .\unexpected-restart-fighter.ps1 [-Verbose] [-Help]"
+    Write-Output "-Verbose: Show detailed events before shutdown, including recent errors."
+    Write-Output "-Help: Display this help message."
+    exit
+}
+
+# Variables
+$daysToCheck = 20
+$timeWindowBeforeShutdown = -5 # in minutes
+
+# Functions
+function Write-Log {
     param (
-        [string]$Message = "Processing"
+        [string]$message
     )
-    $spinnerChars = @('|', '/', '-', '\')
-    $i = 0
-    $script:spinnerJob = Start-Job -ScriptBlock {
-        param ($Message, $spinnerChars)
-        while ($true) {
-            Write-Host -NoNewline "`r$Message $($spinnerChars[$i % $spinnerChars.Length])"
-            Start-Sleep -Milliseconds 100
-            $i++
-        }
-    } -ArgumentList $Message, $spinnerChars
+    Add-Content -Path $logFile -Value $message
+    Write-Output $message
 }
 
-# Stop the spinner once processing is complete
-function Stop-Spinner {
-    Stop-Job $script:spinnerJob -Force
-    Remove-Job $script:spinnerJob
-    Write-Host "`rProcessing complete!`n" -ForegroundColor Green
-}
+# Initialize log
+Write-Log "===== Unexpected Restart Fighter Log ====="
+Write-Log "Run Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+Write-Log "Script Location: $logFile"
 
-# Define the time range (last 20 days)
-$timeLimit = (Get-Date).AddDays(-20)
-
-# Start spinner
-Show-Spinner -Message "Analyzing shutdown events..."
-
-# Get all shutdown/restart events (41, 1074, 6008) within the time range
+# Fetch recent shutdown/restart events (Event IDs: 41, 6008, 1001)
 $shutdownEvents = Get-WinEvent -FilterHashtable @{
     LogName = 'System'
-    Id = @(41, 1074, 6008)
-    StartTime = $timeLimit
-} | Sort-Object TimeCreated
+    Id = @(41, 6008, 1001)
+    StartTime = (Get-Date).AddDays(-$daysToCheck)
+} -ErrorAction SilentlyContinue
 
-# Stop spinner once events are fetched
-Stop-Spinner
-
-# Initialize output for summary and detailed investigation
-$output = ""
-$scriptDirectory = Split-Path -Path $MyInvocation.MyCommand.Definition -Parent
-$logPath = Join-Path -Path $scriptDirectory -ChildPath "DetailedShutdownAnalysis.txt"
-
-# Start analyzing each shutdown event
-Show-Spinner -Message "Analyzing shutdown causes..."
-
-foreach ($event in $shutdownEvents) {
-    $output += "Time: $($event.TimeCreated)`n"
-    $output += "Event ID: $($event.Id)`n"
-    $output += "Description: $($event.Message)`n"
-    $output += "Preceding Events:`n"
-
-    # Capture events before each shutdown to analyze preceding errors or warnings
-    $beforeShutdown = Get-WinEvent -FilterHashtable @{
-        LogName = 'System'
-        Level = @(1, 2, 3) # Error, Warning, Critical levels
-        StartTime = $timeLimit
-        EndTime = $event.TimeCreated.AddMinutes(-1)
-    } | Sort-Object TimeCreated -Descending | Select-Object -First 5
-
-    foreach ($precedingEvent in $beforeShutdown) {
-        $output += "  - Time: $($precedingEvent.TimeCreated), Event ID: $($precedingEvent.Id), Description: $($precedingEvent.Message)`n"
-    }
-    $output += "`n"
+if (-not $shutdownEvents) {
+    Write-Log "No recent shutdown or crash events found in the last $daysToCheck days."
+    exit
 }
 
-# Stop spinner after analysis
-Stop-Spinner
+# Process each shutdown event
+foreach ($event in $shutdownEvents) {
+    $lastShutdownTime = $event.TimeCreated
+    Write-Log "Event Time: $($event.TimeCreated) | Event ID: $($event.Id) | Message: $($event.Message)"
 
-# Display summary on screen
-Write-Host "Shutdown/Restart Events in the Last 20 Days" -ForegroundColor Cyan
-Write-Host $output
+    # Only if -Verbose is set, check for critical error events 5 minutes before shutdown
+    if ($Verbose) {
+        $errorEvents = Get-WinEvent -FilterHashtable @{
+            LogName = 'System'
+            Level = 2
+            StartTime = $lastShutdownTime.AddMinutes($timeWindowBeforeShutdown)
+            EndTime = $lastShutdownTime
+        } -ErrorAction SilentlyContinue
 
-# Save detailed log to the same directory
-$output | Out-File -FilePath $logPath -Encoding UTF8
-Write-Host "Detailed restart logs saved to $logPath" -ForegroundColor Blue
+        if ($errorEvents) {
+            $errorSummary = @{}
+            foreach ($error in $errorEvents) {
+                $eventId = $error.Id
+                if ($errorSummary.ContainsKey($eventId)) {
+                    $errorSummary[$eventId]++
+                } else {
+                    $errorSummary[$eventId] = 1
+                }
+                Write-Log "Error Time: $($error.TimeCreated) | Event ID: $($error.Id) | Message: $($error.Message)"
+            }
+
+            # Summary of hardware errors
+            if ($errorSummary.Count -gt 0) {
+                Write-Log "`nHardware-Related Errors Summary (Last 5 Minutes Before Shutdown):"
+                foreach ($errorType in $errorSummary.Keys) {
+                    Write-Log "Event ID ${errorType}: $($errorSummary[$errorType]) occurrence(s)"
+                }
+            } else {
+                Write-Log "`nNo hardware-related error events found in the last 5 minutes before shutdown."
+            }
+        } else {
+            Write-Log "`nNo critical error events found in the last 5 minutes before shutdown."
+        }
+    }
+}
+
+Write-Log "`nDetailed log saved to $logFile"
